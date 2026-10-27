@@ -85,6 +85,9 @@ void peer_delete(struct peer *peer)
     /* Stop FSM and close connection */
     peer_stop(peer);
 
+    /* Cancel any active timers (including GR restart timers) */
+    bgp_fsm_timer_cancel(peer);
+
     /* Remove from BGP instance */
     if (peer->bgp) {
         listnode_delete(peer->bgp->peer, peer->node);
