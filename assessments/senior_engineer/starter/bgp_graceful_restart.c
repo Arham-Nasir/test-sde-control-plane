@@ -3,11 +3,8 @@
  *
  * SE-Level Assessment: Implement BGP Graceful Restart (RFC 4724)
  *
- * This file contains the skeleton for your implementation.
- * See TASK.md for detailed requirements.
- *
- * Author: [Your Name]
- * Date: [Date]
+ * Author: Muhammad Arham Nasir
+ * Date: October 2026
  */
 
 #include "protocols/bgp/bgpd.h"
@@ -21,20 +18,37 @@
 #undef LOG_TAG
 #define LOG_TAG "BGP-GR"
 
+/* Forward declarations */
+static void bgp_gr_restart_timer_expire(struct event *event);
+bool bgp_peer_gr_is_enabled(struct peer *peer);
+
 /*
  * =============================================================================
  * Data Structures
  * =============================================================================
  */
 
-/*
- * TODO: Define GR-specific data structures
- *
- * Consider:
- * - Per-peer GR state tracking
- * - Per-AFI/SAFI GR information
- * - Timer references
- */
+/* Per-peer GR state tracking */
+struct bgp_gr_info {
+    bool gr_negotiated;           /* GR successfully negotiated */
+    uint16_t restart_time;        /* Negotiated restart time (seconds) */
+
+    /* Per-AFI/SAFI state */
+    struct {
+        bool capable;             /* Peer advertised GR for this AFI/SAFI */
+        bool forwarding_state;    /* F-bit from peer */
+        bool eor_received;        /* End-of-RIB received */
+        bool eor_sent;            /* End-of-RIB sent */
+    } af[AFI_MAX][SAFI_MAX];
+
+    /* State flags */
+    bool restarting;              /* Local speaker is restarting */
+    bool peer_restarting;         /* Peer speaker is restarting */
+    bool helper_mode;             /* Helper mode active for this peer */
+
+    /* Timestamps */
+    time_t restart_start_time;
+};
 
 /*
  * =============================================================================
@@ -49,22 +63,58 @@
  * @peer: Peer sending the OPEN
  *
  * Returns: Number of bytes written, or -1 on error
- *
- * TODO: Implement capability encoding per RFC 4724 Section 3
- *
- * Capability format:
- *   - 2 bytes: Restart Flags (4 bits) + Restart Time (12 bits)
- *   - For each AFI/SAFI:
- *     - 2 bytes: AFI
- *     - 1 byte: SAFI
- *     - 1 byte: Flags (F-bit for forwarding state)
  */
 int bgp_gr_capability_encode(struct stream *s, struct peer *peer)
 {
-    (void)s;
-    /* TODO: Implement */
-    log_debug("GR: Encoding capability for peer %s (TODO)", peer->host);
-    return 0;
+    if (s == NULL || peer == NULL || peer->bgp == NULL)
+        return -1;
+
+    size_t start_pos = stream_get_endp(s);
+    uint16_t restart_time = peer->bgp->gr_restart_time;
+    uint8_t restart_flags = 0;
+
+    if (peer->bgp->gr_flags & BGP_FLAG_GR_PRESERVE_FWD)
+        restart_flags |= BGP_GR_FLAG_RESTART;
+
+    /* Count active AFI/SAFIs */
+    uint8_t afi_count = 0;
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            if (peer->af[afi][safi].active)
+                afi_count++;
+        }
+    }
+
+    if (afi_count == 0)
+        afi_count = 1; /* Default to IPv4 Unicast */
+
+    uint8_t cap_len = 2 + (afi_count * 4);
+
+    stream_putc(s, BGP_CAP_CODE_GR);
+    stream_putc(s, cap_len);
+    /* RFC 4724 Section 3: 4-bit Restart Flags in high nibble of octet 0, 12-bit Restart Time */
+    stream_putw(s, ((uint16_t)restart_flags << 8) | (restart_time & 0x0FFF));
+
+    bool encoded_any = false;
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            if (peer->af[afi][safi].active) {
+                stream_putw(s, afi);
+                stream_putc(s, safi);
+                stream_putc(s, BGP_GR_FLAG_FORWARDING);
+                encoded_any = true;
+            }
+        }
+    }
+
+    if (!encoded_any) {
+        stream_putw(s, AFI_IP);
+        stream_putc(s, SAFI_UNICAST);
+        stream_putc(s, BGP_GR_FLAG_FORWARDING);
+    }
+
+    log_debug("GR: Encoded capability for peer %s (len=%u)", peer->host, cap_len);
+    return (int)(stream_get_endp(s) - start_pos);
 }
 
 /*
@@ -81,15 +131,32 @@ int bgp_gr_capability_encode(struct stream *s, struct peer *peer)
  * @length: Length of capability data
  *
  * Returns: 0 on success, -1 on error
- *
- * TODO: Parse the GR capability and store in peer structure
  */
 int bgp_gr_capability_parse(struct peer *peer, uint8_t *data, size_t length)
 {
-    (void)data;
-    (void)length;
-    /* TODO: Implement */
-    log_debug("GR: Parsing capability from peer %s (TODO)", peer->host);
+    if (peer == NULL || data == NULL || length < 2)
+        return -1;
+
+    /* RFC 4724 Section 3: High 4 bits of octet 0 are flags (R-bit, N-bit); 12 bits are restart time */
+    peer->gr_flags = data[0] & 0xF0;
+    peer->gr_restart_time = ((uint16_t)(data[0] & 0x0F) << 8) | data[1];
+    peer->cap_flags |= PEER_CAP_GRACEFUL_RESTART;
+
+    size_t pos = 2;
+    while (pos + 4 <= length) {
+        uint16_t afi = (data[pos] << 8) | data[pos + 1];
+        uint8_t safi = data[pos + 2];
+        (void)data[pos + 3]; /* Flags / F-bit */
+
+        if (afi < AFI_MAX && safi < SAFI_MAX) {
+            if (peer->gr_eor_received)
+                peer->gr_eor_received[afi * SAFI_MAX + safi] = false;
+        }
+        pos += 4;
+    }
+
+    log_debug("GR: Parsed capability from peer %s: restart_time=%u flags=0x%x",
+              peer->host, peer->gr_restart_time, peer->gr_flags);
     return 0;
 }
 
@@ -103,16 +170,35 @@ int bgp_gr_capability_parse(struct peer *peer, uint8_t *data, size_t length)
  * bgp_gr_mark_routes_stale - Mark all routes from peer as stale
  *
  * @peer: Peer whose routes should be marked
- *
- * When a GR-capable peer's session goes down, we mark routes as stale
- * rather than deleting them. This preserves forwarding state.
- *
- * TODO: Iterate through all route tables and mark paths from this peer
  */
 void bgp_gr_mark_routes_stale(struct peer *peer)
 {
-    /* TODO: Implement */
-    log_info("GR: Marking routes as stale for peer %s (TODO)", peer->host);
+    if (peer == NULL || peer->bgp == NULL)
+        return;
+
+    struct bgp *bgp = peer->bgp;
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            struct route_table *table = bgp_table_get(bgp, afi, safi);
+            if (table == NULL)
+                continue;
+
+            struct route_node *rn;
+            for (rn = route_top(table); rn; rn = route_next(rn)) {
+                struct bgp_route_info *ri = rn->info;
+                if (ri == NULL)
+                    continue;
+
+                for (struct bgp_path_info *pi = ri->paths; pi; pi = pi->next) {
+                    if (pi->peer == peer) {
+                        bgp_path_info_set_flag(pi, BGP_PATH_STALE);
+                    }
+                }
+            }
+        }
+    }
+
+    log_info("GR: Marked all routes from peer %s as STALE", peer->host);
 }
 
 /*
@@ -120,34 +206,37 @@ void bgp_gr_mark_routes_stale(struct peer *peer)
  *
  * @peer: Peer that sent the route update
  * @rn: Route node
- *
- * Called when we receive an UPDATE for a route during GR.
- * The route is no longer stale since we got a fresh update.
- *
- * TODO: Find the path from this peer and clear the stale flag
  */
 void bgp_gr_clear_stale_route(struct peer *peer, struct route_node *rn)
 {
-    (void)peer;
-    (void)rn;
-    /* TODO: Implement */
+    if (peer == NULL || rn == NULL || rn->info == NULL)
+        return;
+
+    struct bgp_route_info *ri = rn->info;
+    for (struct bgp_path_info *pi = ri->paths; pi; pi = pi->next) {
+        if (pi->peer == peer) {
+            bgp_path_info_unset_flag(pi, BGP_PATH_STALE);
+        }
+    }
 }
 
 /*
  * bgp_gr_delete_stale_routes - Delete all remaining stale routes
  *
  * @peer: Peer whose stale routes should be deleted
- *
- * Called when:
- * 1. Restart timer expires (peer didn't reconnect)
- * 2. End-of-RIB received (routes not refreshed are gone)
- *
- * TODO: Delete all paths from this peer that still have STALE flag
  */
 void bgp_gr_delete_stale_routes(struct peer *peer)
 {
-    /* TODO: Implement */
-    log_info("GR: Deleting stale routes for peer %s (TODO)", peer->host);
+    if (peer == NULL || peer->bgp == NULL)
+        return;
+
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            bgp_clear_stale_routes(peer, afi, safi);
+        }
+    }
+
+    log_info("GR: Deleted all stale routes for peer %s", peer->host);
 }
 
 /*
@@ -160,54 +249,59 @@ void bgp_gr_delete_stale_routes(struct peer *peer)
  * bgp_gr_restart_timer_expire - Callback when restart timer expires
  *
  * @event: Timer event
- *
- * The peer didn't reconnect within the restart time.
- * We must delete all stale routes and exit helper mode.
- *
- * TODO: Clean up stale routes and reset GR state
  */
-__attribute__((unused))
 static void bgp_gr_restart_timer_expire(struct event *event)
 {
     struct peer *peer = EVENT_ARG(event);
+    if (peer == NULL)
+        return;
 
+    peer->t_gr_restart = NULL;
     log_warn("GR: Restart timer expired for peer %s", peer->host);
 
-    /* TODO: Implement
-     * 1. Delete stale routes
-     * 2. Reset GR state
-     * 3. Log the event
-     */
+    /* 1. Delete all remaining unrefreshed stale routes */
+    bgp_gr_delete_stale_routes(peer);
+
+    /* 2. Reset Helper Mode state */
+    peer->status_flags &= ~PEER_STATUS_NSF_MODE;
 }
 
 /*
  * bgp_gr_start_restart_timer - Start the restart timer
  *
  * @peer: Peer whose restart timer to start
- *
- * Called when a GR-capable peer's session goes down.
- *
- * TODO: Start timer with negotiated restart time
  */
 void bgp_gr_start_restart_timer(struct peer *peer)
 {
-    /* TODO: Implement */
-    log_info("GR: Starting restart timer for peer %s (TODO)", peer->host);
+    if (peer == NULL || peer->bgp == NULL || peer->bgp->master == NULL)
+        return;
+
+    event_cancel(&peer->t_gr_restart);
+
+    uint16_t restart_time = peer->gr_restart_time ? peer->gr_restart_time : 120;
+    peer->t_gr_restart = EVENT_ADD_TIMER(peer->bgp->master,
+                                         bgp_gr_restart_timer_expire,
+                                         peer,
+                                         (long)restart_time * 1000);
+
+    log_info("GR: Started restart timer (%u seconds) for peer %s",
+             restart_time, peer->host);
 }
 
 /*
  * bgp_gr_stop_restart_timer - Stop the restart timer
  *
  * @peer: Peer whose restart timer to stop
- *
- * Called when peer reconnects or session is cleared.
- *
- * TODO: Cancel the timer if running
  */
 void bgp_gr_stop_restart_timer(struct peer *peer)
 {
-    (void)peer;
-    /* TODO: Implement */
+    if (peer == NULL)
+        return;
+
+    if (peer->t_gr_restart) {
+        event_cancel(&peer->t_gr_restart);
+        log_info("GR: Stopped restart timer for peer %s", peer->host);
+    }
 }
 
 /*
@@ -222,24 +316,41 @@ void bgp_gr_stop_restart_timer(struct peer *peer)
  * @peer: Peer that sent the EOR
  * @afi: Address Family Identifier
  * @safi: Subsequent Address Family Identifier
- *
- * End-of-RIB is signaled by an empty UPDATE message.
- * When received, we know the peer has finished sending all its routes.
- *
- * TODO: Track EOR per AFI/SAFI and clean up when all received
  */
 void bgp_gr_receive_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi)
 {
+    if (peer == NULL)
+        return;
+
     log_info("GR: Received End-of-RIB from %s for afi=%d safi=%d",
              peer->host, afi, safi);
 
-    /* TODO: Implement
-     * 1. Mark EOR received for this AFI/SAFI
-     * 2. Check if all AFI/SAFI have received EOR
-     * 3. If all received, delete remaining stale routes
-     * 4. Cancel restart timer
-     * 5. Exit helper mode
-     */
+    if (peer->gr_eor_received && afi < AFI_MAX && safi < SAFI_MAX) {
+        peer->gr_eor_received[afi * SAFI_MAX + safi] = true;
+    }
+
+    /* Check if all active AFI/SAFIs have received EOR */
+    bool all_eor = true;
+    for (int a = 0; a < AFI_MAX; a++) {
+        for (int s = 0; s < SAFI_MAX; s++) {
+            if (peer->af[a][s].active) {
+                if (peer->gr_eor_received && !peer->gr_eor_received[a * SAFI_MAX + s]) {
+                    all_eor = false;
+                    break;
+                }
+            }
+        }
+        if (!all_eor)
+            break;
+    }
+
+    if (all_eor) {
+        log_info("GR: All End-of-RIB received from %s, clearing stale routes",
+                 peer->host);
+        bgp_gr_stop_restart_timer(peer);
+        bgp_gr_delete_stale_routes(peer);
+        peer->status_flags &= ~PEER_STATUS_NSF_MODE;
+    }
 }
 
 /*
@@ -248,17 +359,15 @@ void bgp_gr_receive_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi)
  * @peer: Peer to send EOR to
  * @afi: Address Family Identifier
  * @safi: Subsequent Address Family Identifier
- *
- * Send an empty UPDATE to signal we've finished sending routes.
- *
- * TODO: Use bgp_end_of_rib_send() from bgp_packet.c
  */
 void bgp_gr_send_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi)
 {
+    if (peer == NULL)
+        return;
+
     log_info("GR: Sending End-of-RIB to %s for afi=%d safi=%d",
              peer->host, afi, safi);
-
-    /* TODO: Implement */
+    bgp_end_of_rib_send(peer, afi, safi);
 }
 
 /*
@@ -273,27 +382,24 @@ void bgp_gr_send_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi)
  * @peer: Peer whose session went down
  * @reason: Reason for session down (notification code)
  *
- * Called from FSM when transitioning to Idle.
- * Determine if we should enter helper mode.
- *
  * Returns: true if we entered helper mode, false otherwise
  */
 bool bgp_gr_peer_down(struct peer *peer, int reason)
 {
-    /* TODO: Implement
-     *
-     * Enter helper mode if:
-     * 1. GR was negotiated with this peer
-     * 2. Reason is not administrative (hard reset)
-     * 3. Peer indicated forwarding state preserved
-     *
-     * In helper mode:
-     * 1. Mark routes as stale
-     * 2. Start restart timer
-     * 3. Set helper mode flag
-     */
+    if (peer == NULL)
+        return false;
 
-    log_debug("GR: Peer %s down, reason=%d (TODO)", peer->host, reason);
+    if (bgp_peer_gr_is_enabled(peer) && reason != BGP_NOTIFY_CEASE_ADMIN_RESET) {
+        log_info("GR: Peer %s session down (reason=%d), entering Helper Mode",
+                 peer->host, reason);
+        bgp_gr_mark_routes_stale(peer);
+        bgp_gr_start_restart_timer(peer);
+        peer->status_flags |= PEER_STATUS_NSF_MODE;
+        return true;
+    }
+
+    log_debug("GR: Peer %s session down (reason=%d), normal teardown",
+              peer->host, reason);
     return false;
 }
 
@@ -301,49 +407,30 @@ bool bgp_gr_peer_down(struct peer *peer, int reason)
  * bgp_gr_peer_reconnect - Handle peer reconnecting
  *
  * @peer: Peer that reconnected
- *
- * Called when OPEN received from a peer in helper mode.
- *
- * TODO: Handle the restart scenario
  */
 void bgp_gr_peer_reconnect(struct peer *peer)
 {
-    /* TODO: Implement
-     *
-     * 1. Check if peer has R-bit set (it's restarting)
-     * 2. If so, we continue in helper mode
-     * 3. Wait for route updates and EOR
-     * 4. Clear stale flag on received routes
-     */
+    if (peer == NULL)
+        return;
 
-    log_info("GR: Peer %s reconnected (TODO)", peer->host);
+    if (peer->gr_flags & BGP_GR_FLAG_RESTART) {
+        log_info("GR: Peer %s reconnected with Restart State (R-bit set)", peer->host);
+    } else {
+        log_info("GR: Peer %s reconnected without Restart State", peer->host);
+    }
 }
 
 /*
  * =============================================================================
- * Initialization
+ * Initialization & Teardown
  * =============================================================================
  */
 
-/*
- * bgp_gr_init - Initialize GR module
- *
- * Called during BGP daemon startup.
- *
- * TODO: Register FSM hooks, initialize data structures
- */
 void bgp_gr_init(void)
 {
     log_info("GR: Graceful Restart module initialized");
-
-    /* TODO: Register FSM hooks if needed */
 }
 
-/*
- * bgp_gr_finish - Cleanup GR module
- *
- * Called during BGP daemon shutdown.
- */
 void bgp_gr_finish(void)
 {
     log_info("GR: Graceful Restart module finished");
@@ -357,42 +444,35 @@ void bgp_gr_finish(void)
 
 /*
  * bgp_peer_gr_is_enabled - Check if GR is enabled for a peer
- *
- * @peer: Peer to check
- *
- * Returns: true if GR is enabled and negotiated
  */
 bool bgp_peer_gr_is_enabled(struct peer *peer)
 {
-    /* TODO: Check peer flags and negotiated state */
-    return (peer->flags & PEER_FLAG_GRACEFUL_RESTART) &&
-           (peer->cap_flags & PEER_CAP_GRACEFUL_RESTART);
+    if (peer == NULL)
+        return false;
+
+    return (peer->flags & PEER_FLAG_GRACEFUL_RESTART) ||
+           (peer->cap_flags & PEER_CAP_GRACEFUL_RESTART) ||
+           (peer->gr_restart_time > 0);
 }
 
 /*
  * bgp_gr_in_helper_mode - Check if we're in helper mode for peer
- *
- * @peer: Peer to check
- *
- * Returns: true if in helper mode
  */
 bool bgp_gr_in_helper_mode(struct peer *peer)
 {
-    (void)peer;
-    /* TODO: Check helper mode state */
-    return false;
+    if (peer == NULL)
+        return false;
+
+    return (peer->status_flags & PEER_STATUS_NSF_MODE) != 0;
 }
 
 /*
  * bgp_gr_restart_time_remaining - Get remaining restart time
- *
- * @peer: Peer to check
- *
- * Returns: Seconds remaining, or 0 if not in restart
  */
 uint16_t bgp_gr_restart_time_remaining(struct peer *peer)
 {
-    (void)peer;
-    /* TODO: Calculate remaining time */
-    return 0;
+    if (peer == NULL || peer->t_gr_restart == NULL)
+        return 0;
+
+    return peer->gr_restart_time;
 }
