@@ -221,10 +221,11 @@ void bgp_fsm_timer_cancel(struct peer *peer)
     event_cancel(&peer->t_gr_restart);
 }
 
+static void bgp_gr_restart_timer_expire(struct event *event);
+
 /* FSM state transition functions */
 int bgp_fsm_to_idle(struct peer *peer, int reason)
 {
-    (void)reason;
     bgp_fsm_timer_cancel(peer);
 
     /* Close TCP connection */
@@ -232,6 +233,27 @@ int bgp_fsm_to_idle(struct peer *peer, int reason)
 
     /* Clear work queues */
     peer_clear_buffers(peer);
+
+    /* Check if we should enter Graceful Restart helper mode */
+    if (peer->state == BGP_STATUS_ESTABLISHED) {
+        if (bgp_peer_gr_capable(peer) && reason != BGP_NOTIFY_CEASE_ADMIN_RESET) {
+            bgp_gr_stale_routes(peer);
+            peer->status_flags |= PEER_STATUS_NSF_MODE;
+            if (peer->bgp && peer->bgp->master) {
+                uint16_t restart_time = peer->gr_restart_time ? peer->gr_restart_time : 120;
+                peer->t_gr_restart = EVENT_ADD_TIMER(peer->bgp->master,
+                                                     bgp_gr_restart_timer_expire,
+                                                     peer,
+                                                     (long)restart_time * 1000);
+            }
+        } else {
+            for (int afi = 0; afi < AFI_MAX; afi++) {
+                for (int safi = 0; safi < SAFI_MAX; safi++) {
+                    bgp_clear_route(peer, afi, safi);
+                }
+            }
+        }
+    }
 
     fsm_change_state(peer, BGP_STATUS_IDLE);
     return 0;
@@ -500,15 +522,27 @@ int bgp_fsm_event(struct peer *peer, bgp_fsm_event_t event)
 
 /*
  * Graceful Restart Functions
- *
- * TODO: These are stub implementations. Candidates implementing the
- * SE-level assessment should complete these functions.
  */
+
+static void bgp_gr_restart_timer_expire(struct event *event)
+{
+    struct peer *peer = EVENT_ARG(event);
+    if (!peer)
+        return;
+
+    peer->t_gr_restart = NULL;
+    log_warn("BGP peer %s GR restart timer expired", peer->host);
+    bgp_gr_clear_stale_routes(peer);
+    peer->status_flags &= ~PEER_STATUS_NSF_MODE;
+}
 
 bool bgp_peer_gr_capable(struct peer *peer)
 {
-    /* TODO: Check peer's GR capability from OPEN message */
-    return peer->gr_restart_time > 0;
+    if (!peer)
+        return false;
+    return (peer->cap_flags & PEER_CAP_GRACEFUL_RESTART) != 0 ||
+           (peer->flags & PEER_FLAG_GRACEFUL_RESTART) != 0 ||
+           peer->gr_restart_time > 0;
 }
 
 void bgp_gr_stale_routes(struct peer *peer)
@@ -542,26 +576,46 @@ void bgp_gr_stale_routes(struct peer *peer)
 
 void bgp_gr_clear_stale_routes(struct peer *peer)
 {
-    /*
-     * TODO: Remove stale routes when GR timer expires
-     *
-     * This is called when:
-     * 1. GR stale timer expires
-     * 2. Session is explicitly cleared
-     */
-    log_debug("BGP peer %s clearing stale routes (TODO)", peer->host);
+    if (!peer || !peer->bgp)
+        return;
+
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            bgp_clear_stale_routes(peer, afi, safi);
+        }
+    }
+    log_info("BGP peer %s: cleared all stale routes", peer->host);
 }
 
 void bgp_gr_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi)
 {
-    /*
-     * TODO: Process End-of-RIB marker
-     *
-     * End-of-RIB is signaled by an empty UPDATE message.
-     * When received:
-     * 1. Mark peer as converged for this AFI/SAFI
-     * 2. If all AFI/SAFI converged, clear stale routes
-     */
-    log_debug("BGP peer %s End-of-RIB for afi=%d safi=%d (TODO)",
-              peer->host, afi, safi);
+    if (!peer)
+        return;
+
+    log_info("BGP peer %s End-of-RIB for afi=%d safi=%d", peer->host, afi, safi);
+
+    if (peer->gr_eor_received && afi < AFI_MAX && safi < SAFI_MAX) {
+        peer->gr_eor_received[afi * SAFI_MAX + safi] = true;
+    }
+
+    bool all_eor = true;
+    for (int a = 0; a < AFI_MAX; a++) {
+        for (int s = 0; s < SAFI_MAX; s++) {
+            if (peer->af[a][s].active) {
+                if (peer->gr_eor_received && !peer->gr_eor_received[a * SAFI_MAX + s]) {
+                    all_eor = false;
+                    break;
+                }
+            }
+        }
+        if (!all_eor)
+            break;
+    }
+
+    if (all_eor) {
+        event_cancel(&peer->t_gr_restart);
+        bgp_gr_clear_stale_routes(peer);
+        peer->status_flags &= ~PEER_STATUS_NSF_MODE;
+        log_info("BGP peer %s: all EoR received, exited helper mode", peer->host);
+    }
 }
