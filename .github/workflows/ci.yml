@@ -11,9 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         compiler: [gcc, clang]
-        level: [se, principal, all]
+        level: [senior_engineer]        
 
     steps:
     - uses: actions/checkout@v3

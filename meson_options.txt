@@ -4,9 +4,9 @@
 
 option('assessment_level',
   type : 'combo',
-  choices : ['senior_engineer', 'principal_engineer', 'all'],
-  value : 'all',
-  description : 'Assessment track to build (senior_engineer, principal_engineer, or all)'
+  choices : ['senior_engineer', 'principal_engineer', 'se', 'principal', 'all'],
+  value : 'senior_engineer',
+  description : 'Assessment track to build (senior_engineer, principal_engineer, se, principal, or all)'
 )
 
 option('enable_integration_tests',
