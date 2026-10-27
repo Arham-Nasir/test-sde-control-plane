@@ -5,6 +5,7 @@
 #include "bgpd.h"
 #include "bgp_fsm.h"
 #include "bgp_neighbor.h"
+#include "bgp_route.h"
 #include "common/log.h"
 
 #include <string.h>
@@ -130,11 +131,27 @@ void bgp_delete(struct bgp *bgp)
     list_delete(&bgp->peer);
     hash_clean_and_free(&bgp->peerhash, NULL);
 
-    /* Delete route tables */
+    /* Delete route tables and any remaining routes/paths */
     for (int afi = 0; afi < AFI_MAX; afi++) {
         for (int safi = 0; safi < SAFI_MAX; safi++) {
-            if (bgp->rib[afi][safi])
-                route_table_finish(bgp->rib[afi][safi]);
+            struct route_table *table = bgp->rib[afi][safi];
+            if (table) {
+                struct route_node *rn;
+                for (rn = route_top(table); rn; rn = route_next(rn)) {
+                    struct bgp_route_info *ri = rn->info;
+                    if (ri) {
+                        struct bgp_path_info *pi, *next;
+                        for (pi = ri->paths; pi; pi = next) {
+                            next = pi->next;
+                            bgp_path_info_free(pi);
+                        }
+                        XFREE(MTYPE_BGP_ROUTE, ri);
+                        rn->info = NULL;
+                    }
+                }
+                route_table_finish(table);
+                bgp->rib[afi][safi] = NULL;
+            }
         }
     }
 
