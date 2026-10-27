@@ -6,6 +6,7 @@
 
 #include "bgp_fsm.h"
 #include "bgp_packet.h"
+#include "bgp_route.h"
 #include "common/log.h"
 
 #include <string.h>
@@ -512,15 +513,31 @@ bool bgp_peer_gr_capable(struct peer *peer)
 
 void bgp_gr_stale_routes(struct peer *peer)
 {
-    /*
-     * TODO: Mark all routes from this peer as stale
-     *
-     * When a peer goes down and supports GR:
-     * 1. Mark all routes from peer with STALE flag
-     * 2. Start stale timer
-     * 3. Keep routes in RIB until timer expires or peer reconnects
-     */
-    log_debug("BGP peer %s marking routes as stale (TODO)", peer->host);
+    if (!peer || !peer->bgp)
+        return;
+
+    struct bgp *bgp = peer->bgp;
+    for (int afi = 0; afi < AFI_MAX; afi++) {
+        for (int safi = 0; safi < SAFI_MAX; safi++) {
+            struct route_table *table = bgp_table_get(bgp, afi, safi);
+            if (!table)
+                continue;
+
+            struct route_node *rn;
+            for (rn = route_top(table); rn; rn = route_next(rn)) {
+                struct bgp_route_info *ri = rn->info;
+                if (!ri)
+                    continue;
+
+                for (struct bgp_path_info *pi = ri->paths; pi; pi = pi->next) {
+                    if (pi->peer == peer) {
+                        bgp_path_info_set_flag(pi, BGP_PATH_STALE);
+                    }
+                }
+            }
+        }
+    }
+    log_info("BGP peer %s: marked all routes as STALE", peer->host);
 }
 
 void bgp_gr_clear_stale_routes(struct peer *peer)
