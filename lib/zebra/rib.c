@@ -176,7 +176,7 @@ struct route_node *route_node_get(struct route_table *table, struct prefix *p)
 
     /* If we have a node that doesn't match (sibling case), we need to create
      * an intermediate node at the point where the prefixes diverge */
-    if (node && !match) {
+    if (node) {
         /* Find where the prefixes diverge */
         uint8_t common_bits = prefix_common_bits(&node->p, p);
 
