@@ -175,7 +175,7 @@ static bool route_exists(struct bgp *bgp, const char *prefix_str)
 /*
  * Test 1: GR Capability Encoding
  *
- * Verify that GR capability is correctly encoded in OPEN message.
+ * Verify that GR capability is correctly encoded in OPEN message per RFC 4724 Section 3.
  */
 static int test_gr_capability_encoding(void)
 {
@@ -190,22 +190,46 @@ static int test_gr_capability_encoding(void)
     /* Create stream for capability encoding */
     s = stream_new(4096);
 
-    /* The implementation should encode GR capability */
-    /* Expected: 2 bytes restart flags+time, then 4 bytes per AFI/SAFI */
-    /* Minimum length for GR cap with one AFI/SAFI is 6 bytes */
+    int bytes_written = bgp_gr_capability_encode(s, peer);
+    TEST_ASSERT(bytes_written >= 6, "Encoded capability should be at least 6 bytes (2 hdr + 4 per AFI/SAFI)");
+
+    /* Reset stream read pointer to verify serialized wire bytes */
+    stream_set_getp(s, 0);
+
+    /* 1. Capability Code */
+    uint8_t cap_code = stream_getc(s);
+    TEST_ASSERT(cap_code == BGP_CAP_CODE_GR, "Capability code must be 64 (Graceful Restart)");
+
+    /* 2. Capability Length */
+    uint8_t cap_len = stream_getc(s);
+    TEST_ASSERT(cap_len == 6, "Capability length must be 6 for IPv4 Unicast");
+
+    /* 3. Restart Flags (4 bits) + Restart Time (12 bits) */
+    uint16_t restart_val = stream_getw(s);
+    uint16_t restart_time = restart_val & 0x0FFF;
+    TEST_ASSERT(restart_time == 120, "Negotiated restart time must match configured 120s");
+
+    /* 4. AFI (2 octets) */
+    uint16_t afi = stream_getw(s);
+    TEST_ASSERT(afi == AFI_IP, "AFI must be AFI_IP (1)");
+
+    /* 5. SAFI (1 octet) */
+    uint8_t safi = stream_getc(s);
+    TEST_ASSERT(safi == SAFI_UNICAST, "SAFI must be SAFI_UNICAST (1)");
+
+    /* 6. Flags for address family (F-bit: Forwarding State preserved) */
+    uint8_t flags = stream_getc(s);
+    TEST_ASSERT((flags & BGP_GR_FLAG_FORWARDING) != 0, "Forwarding State (F-bit) must be set");
 
     stream_free(s);
     test_teardown();
-
-    /* Note: This test passes if encoding doesn't crash.
-     * Full verification requires examining the encoded bytes. */
     return 0;
 }
 
 /*
  * Test 2: GR Capability Parsing
  *
- * Verify that GR capability is correctly parsed from peer's OPEN.
+ * Verify that GR capability wire bytes are correctly parsed into peer structure.
  */
 static int test_gr_capability_parsing(void)
 {
@@ -215,12 +239,23 @@ static int test_gr_capability_parsing(void)
 
     peer = create_test_peer("10.0.0.2", 65002);
 
-    /* Set GR restart time to simulate received capability */
-    peer->gr_restart_time = 120;
-    peer->cap_flags |= PEER_CAP_GRACEFUL_RESTART;
+    /* Simulated incoming OPEN capability wire bytes:
+     * Restart Flags: 0x80 (R-bit set = 1)
+     * Restart Time: 180 seconds (0x0B4) -> Combined 16-bit = 0x80B4
+     * AFI: 1 (IPv4), SAFI: 1 (Unicast), Flags: 0x80 (F-bit = 1)
+     */
+    uint8_t wire_data[] = {
+        0x80, 0xB4,       /* Flags (R-bit=1) + Restart Time (180s) */
+        0x00, 0x01,       /* AFI = 1 (IPv4) */
+        0x01,             /* SAFI = 1 (Unicast) */
+        0x80              /* Flags (F-bit=1) */
+    };
 
-    /* Verify GR is recognized as capable */
-    TEST_ASSERT(bgp_peer_gr_capable(peer), "Peer should be GR capable");
+    int ret = bgp_gr_capability_parse(peer, wire_data, sizeof(wire_data));
+    TEST_ASSERT(ret == 0, "Parsing wire GR capability should succeed");
+    TEST_ASSERT(peer->gr_restart_time == 180, "Parsed restart time must be 180s");
+    TEST_ASSERT((peer->gr_flags & BGP_GR_FLAG_RESTART) != 0, "R-bit must be parsed");
+    TEST_ASSERT(bgp_peer_gr_capable(peer), "Peer must be recognized as GR capable");
 
     test_teardown();
     return 0;
@@ -481,6 +516,110 @@ static int test_gr_capability_check(void)
 }
 
 /*
+ * Test 10: Partial Route Refresh (TASK.md Scenario 5)
+ *
+ * Peer advertises multiple routes, restarts, and only refreshes a subset.
+ * Verified: Refreshed routes have STALE cleared and are preserved;
+ * unrefreshed routes remain STALE and are purged upon End-of-RIB.
+ */
+static int test_partial_route_refresh(void)
+{
+    struct peer *peer;
+
+    test_setup();
+
+    peer = create_test_peer("10.0.0.2", 65002);
+    peer->state = BGP_STATUS_ESTABLISHED;
+    peer->cap_flags |= PEER_CAP_GRACEFUL_RESTART;
+
+    /* 1. Advertise Route 1 and Route 2 */
+    add_test_route(peer, "10.10.1.0/24");
+    add_test_route(peer, "10.10.2.0/24");
+
+    TEST_ASSERT(route_exists(bgp, "10.10.1.0/24"), "Route 1 must exist initially");
+    TEST_ASSERT(route_exists(bgp, "10.10.2.0/24"), "Route 2 must exist initially");
+
+    /* 2. Peer session drops -> enters Helper Mode, marks routes STALE */
+    bgp_gr_peer_down(peer, BGP_NOTIFY_CEASE);
+    TEST_ASSERT(route_is_stale(bgp, peer, "10.10.1.0/24"), "Route 1 must be marked STALE");
+    TEST_ASSERT(route_is_stale(bgp, peer, "10.10.2.0/24"), "Route 2 must be marked STALE");
+
+    /* 3. Peer restarts and only re-advertises Route 1 (subset refresh) */
+    add_test_route(peer, "10.10.1.0/24");
+
+    /* Route 1 stale flag cleared; Route 2 remains STALE */
+    TEST_ASSERT(!route_is_stale(bgp, peer, "10.10.1.0/24"), "Refreshed Route 1 must NOT be stale");
+    TEST_ASSERT(route_is_stale(bgp, peer, "10.10.2.0/24"), "Unrefreshed Route 2 must remain STALE");
+
+    /* 4. End-of-RIB received from peer -> cleanup unrefreshed stale routes */
+    bgp_gr_receive_end_of_rib(peer, AFI_IP, SAFI_UNICAST);
+
+    /* Refreshed Route 1 is kept in RIB; unrefreshed Route 2 is deleted */
+    TEST_ASSERT(route_exists(bgp, "10.10.1.0/24"), "Refreshed Route 1 must be retained");
+    TEST_ASSERT(!route_is_stale(bgp, peer, "10.10.2.0/24"), "Unrefreshed Route 2 must be purged");
+
+    test_teardown();
+    return 0;
+}
+
+/*
+ * Test 11: Administrative Reset Bypasses Helper Mode (RFC 4724 Section 4.2)
+ *
+ * When session closes due to Administrative Reset (Cease/Admin Reset),
+ * Helper mode MUST NOT be activated and routes must be purged immediately.
+ */
+static int test_admin_reset_bypasses_helper(void)
+{
+    struct peer *peer;
+
+    test_setup();
+
+    peer = create_test_peer("10.0.0.2", 65002);
+    peer->state = BGP_STATUS_ESTABLISHED;
+    peer->cap_flags |= PEER_CAP_GRACEFUL_RESTART;
+
+    add_test_route(peer, "10.20.1.0/24");
+    TEST_ASSERT(route_exists(bgp, "10.20.1.0/24"), "Route must exist initially");
+
+    /* Session down due to BGP_NOTIFY_CEASE_ADMIN_RESET */
+    bool entered_helper = bgp_gr_peer_down(peer, BGP_NOTIFY_CEASE_ADMIN_RESET);
+    TEST_ASSERT(!entered_helper, "Admin Reset MUST NOT enter Helper Mode");
+
+    /* Routes are cleared directly */
+    bgp_clear_route(peer, AFI_IP, SAFI_UNICAST);
+    TEST_ASSERT(!route_is_stale(bgp, peer, "10.20.1.0/24"), "Route must not be retained as stale");
+
+    test_teardown();
+    return 0;
+}
+
+/*
+ * Test 12: Malformed Wire Capability Rejection
+ *
+ * Tests parser robustness against truncated lengths and NULL buffers.
+ */
+static int test_gr_capability_malformed(void)
+{
+    struct peer *peer;
+
+    test_setup();
+
+    peer = create_test_peer("10.0.0.2", 65002);
+
+    /* Truncated length (1 byte instead of minimum 2) */
+    uint8_t short_data[1] = { 0x00 };
+    int ret = bgp_gr_capability_parse(peer, short_data, 1);
+    TEST_ASSERT(ret == -1, "Truncated capability (1 byte) must return -1");
+
+    /* NULL data buffer */
+    ret = bgp_gr_capability_parse(peer, NULL, 6);
+    TEST_ASSERT(ret == -1, "NULL buffer must return -1");
+
+    test_teardown();
+    return 0;
+}
+
+/*
  * Main test runner
  */
 int main(int argc, char **argv)
@@ -506,6 +645,9 @@ int main(int argc, char **argv)
     RUN_TEST("Non-GR Peer Immediate Delete", test_non_gr_peer_immediate_delete);
     RUN_TEST("End-of-RIB Detection", test_end_of_rib_detection);
     RUN_TEST("GR Capability Check", test_gr_capability_check);
+    RUN_TEST("Partial Route Refresh (TASK Scenario 5)", test_partial_route_refresh);
+    RUN_TEST("Admin Reset Bypasses Helper (RFC 4724)", test_admin_reset_bypasses_helper);
+    RUN_TEST("Malformed Wire Capability Rejection", test_gr_capability_malformed);
 
     /* Summary */
     printf("\n");
