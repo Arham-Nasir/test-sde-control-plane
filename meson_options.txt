@@ -1,0 +1,38 @@
+# =============================================================================
+# Build Options for Control Plane Assessment
+# =============================================================================
+
+option('assessment_level',
+  type : 'combo',
+  choices : ['senior_engineer', 'principal_engineer', 'all'],
+  value : 'all',
+  description : 'Assessment track to build (senior_engineer, principal_engineer, or all)'
+)
+
+option('enable_integration_tests',
+  type : 'boolean',
+  value : true,
+  description : 'Enable integration tests'
+)
+
+option('enable_verbose_logging',
+  type : 'boolean',
+  value : false,
+  description : 'Enable verbose debug logging'
+)
+
+option('max_neighbors',
+  type : 'integer',
+  min : 1,
+  max : 10000,
+  value : 1000,
+  description : 'Maximum number of BGP neighbors supported'
+)
+
+option('max_routes',
+  type : 'integer',
+  min : 1000,
+  max : 10000000,
+  value : 1000000,
+  description : 'Maximum number of routes in RIB'
+)

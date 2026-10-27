@@ -1,0 +1,8 @@
+# Standard Meson build directories
+build/
+builddir/
+
+# Artefacts created by scripts/prepare_candidate_package.sh
+*.tar.gz
+
+.DS_Store

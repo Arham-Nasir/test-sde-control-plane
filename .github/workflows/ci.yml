@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, solutions ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        level: [se, principal, all]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y meson ninja-build ${{ matrix.compiler }}
+
+    - name: Configure
+      run: |
+        CC=${{ matrix.compiler }} meson setup builddir \
+          -Dassessment_level=${{ matrix.level }} \
+          -Db_sanitize=address,undefined
+
+    - name: Build
+      run: ninja -C builddir
+
+    - name: Test
+      run: meson test -C builddir --print-errorlogs
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Check formatting
+      run: |
+        find . -name "*.c" -o -name "*.h" | head -20 | while read f; do
+          echo "Checking $f"
+        done

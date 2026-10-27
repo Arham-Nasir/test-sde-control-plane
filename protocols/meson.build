@@ -1,0 +1,2 @@
+# Protocol daemons
+subdir('bgp')
