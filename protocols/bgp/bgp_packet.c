@@ -183,6 +183,13 @@ int bgp_notify_send_with_data(struct peer *peer, uint8_t code, uint8_t subcode,
 
     bgp_packet_set_header(s, BGP_MSG_NOTIFICATION);
 
+    if (peer->fd < 0) {
+        peer->notify_out++;
+        log_debug("BGP peer %s NOTIFICATION simulated: %s/%s",
+                  peer->host, bgp_error_str(code), bgp_error_subcode_str(code, subcode));
+        return 0;
+    }
+
     ssize_t written = write(peer->fd, STREAM_DATA(s), stream_get_endp(s));
     if (written < 0) {
         log_err("BGP peer %s NOTIFICATION send failed: %s",
@@ -212,6 +219,13 @@ int bgp_end_of_rib_send(struct peer *peer, uint8_t afi, uint8_t safi)
     stream_putw(s, 0);          /* Total path attribute length */
 
     bgp_packet_set_header(s, BGP_MSG_UPDATE);
+
+    if (peer->fd < 0) {
+        peer->update_out++;
+        log_debug("BGP peer %s sent End-of-RIB for afi=%d safi=%d (simulated)",
+                  peer->host, afi, safi);
+        return 0;
+    }
 
     ssize_t written = write(peer->fd, STREAM_DATA(s), stream_get_endp(s));
     if (written < 0) {
