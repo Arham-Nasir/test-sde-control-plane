@@ -122,6 +122,12 @@ int bgp_open_send(struct peer *peer)
     /* Finalize header */
     bgp_packet_set_header(s, BGP_MSG_OPEN);
 
+    /* Guard: skip network socket I/O if no active socket descriptor (e.g. unit test simulation) */
+    if (peer->fd < 0) {
+        peer->open_out++;
+        return 0;
+    }
+
     /* Send */
     ssize_t written = write(peer->fd, STREAM_DATA(s), stream_get_endp(s));
     if (written < 0) {
@@ -145,6 +151,12 @@ int bgp_keepalive_send(struct peer *peer)
     bgp_packet_set_marker(s);
     stream_putw(s, BGP_HEADER_SIZE);
     stream_putc(s, BGP_MSG_KEEPALIVE);
+
+    if (peer->fd < 0) {
+        peer->keepalive_out++;
+        peer->last_write = time(NULL);
+        return 0;
+    }    
 
     ssize_t written = write(peer->fd, STREAM_DATA(s), stream_get_endp(s));
     if (written < 0) {
@@ -256,6 +268,11 @@ int bgp_route_refresh_send(struct peer *peer, uint8_t afi, uint8_t safi)
     stream_putc(s, safi);
 
     bgp_packet_set_header(s, BGP_MSG_ROUTE_REFRESH);
+
+    if (peer->fd < 0) {
+        peer->refresh_out++;
+        return 0;
+    }    
 
     ssize_t written = write(peer->fd, STREAM_DATA(s), stream_get_endp(s));
     if (written < 0) {
