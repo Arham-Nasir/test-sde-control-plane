@@ -128,13 +128,8 @@ int bgp_fsm_to_openconfirm(struct peer *peer);
 /* Change to Established state */
 int bgp_fsm_to_established(struct peer *peer);
 
-/*
- * Graceful Restart FSM Extensions
- *
- * TODO: Candidates implementing GR should extend these functions
- * to handle restart scenarios, stale route marking, and timer
- * management.
- */
+/* Cancel all pending FSM and GR timers for peer */
+void bgp_fsm_timer_cancel(struct peer *peer);
 
 /* Check if peer supports Graceful Restart */
 bool bgp_peer_gr_capable(struct peer *peer);
@@ -147,6 +142,14 @@ void bgp_gr_clear_stale_routes(struct peer *peer);
 
 /* Process End-of-RIB marker */
 void bgp_gr_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi);
+
+/* Encode/Parse GR capabilities (RFC 4724 Section 3) */
+int bgp_gr_capability_encode(struct stream *s, struct peer *peer);
+int bgp_gr_capability_parse(struct peer *peer, uint8_t *data, size_t length);
+
+/* Session state handling */
+bool bgp_gr_peer_down(struct peer *peer, int reason);
+void bgp_gr_receive_end_of_rib(struct peer *peer, uint8_t afi, uint8_t safi);
 
 #ifdef __cplusplus
 }
