@@ -1,5 +1,16 @@
 # Control Plane Technical Assessment
 
+> **Candidate:** Muhammad Arham Nasir  
+> **Assessment Track:** Senior Software Engineer - BGP Graceful Restart (RFC 4724)  
+> **Reviewer:** Mohamed EL GAMAL (`melgamal@jobsaicloud.com`)  
+> **Status:** 100% Tests Passing (`12/12` Unit Tests, `5/5` Integration Tests)  
+> **Sanitizers:** Clean under AddressSanitizer & UBSan (0 bytes leaked)  
+> **CI/CD Pipeline:** `✔ 3/3 checks passing` on GitHub Actions  
+> **Engineering Report:** Please refer to [SUBMISSION_REPORT.md](SUBMISSION_REPORT.md) for complete architecture, implementation sequence, and test logs.
+
+---
+
+
 A comprehensive technical assessment for Software Engineers specializing in Control Plane and Network Operating System (NOS) subsystems.
 
 ## Overview
